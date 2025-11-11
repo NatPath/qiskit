@@ -111,29 +111,64 @@ def _closest_unitary(x: np.ndarray) -> np.ndarray:
     return u_mat @ vh_mat
 
 
-def _permutation_matrix_from_qubit_order(
-    new_order: Sequence[int],
-    n: int,
-) -> np.ndarray:
+def _permutation_matrix_from_qubit_order(new_order: Sequence[int], n: int) -> np.ndarray:
     """
-    Return the (2**n x 2**n) boolean permutation matrix P that reorders **little‑endian** qubits.
+    Return the ``(2**n) x (2**n)`` permutation matrix ``P`` that reorders **little‑endian** qubits.
 
     Little‑endian convention: qubit 0 is the **least significant bit** (LSB).
 
-    - ``new_order[k]`` is the original qubit that becomes bit-position ``k`` in the *new*
-      representation (with ``k=0`` the LSB).
-    - States: ``|psi_new> = P |psi_old>``
-    - Operators: ``U_new = P U_old P^T``  (P is real, so P^T = P.conj().T)
+    Mapping (bits → indices):
+      * ``new_order[k]`` gives which **original** qubit becomes bit‑position ``k`` in the **new**
+        representation (with ``k=0`` the LSB).
+      * For a computational basis state with original bitstring
+        ``b = (b_{n-1} ... b_1 b_0)`` we form the new bitstring ``b'`` by
+        ``b'_k = b_{ new_order[k] }``.
+      * Index mapping: ``i' = sum_k b'_k 2^k``.
 
-    This is identical to the permutation used in the OSD module.
+    Action:
+      * States: ``|psi_new> = P |psi_old>``.
+      * Operators: ``U_new = P U_old P^T`` (``P`` is real; ``P^T = P.conj().T``).
+
+    Args:
+        new_order: A permutation of ``range(n)`` where entry ``k`` is the original qubit index that
+            becomes bit‑position ``k`` in the new ordering (LSB is ``k=0``).
+        n: Number of qubits.
+
+    Returns:
+        P: A boolean permutation matrix of shape ``(2**n, 2**n)`` such that the above actions hold.
+
+    Raises:
+        QiskitError: If ``new_order`` is not a permutation of ``range(n)`` or sizes mismatch.
+
+    Example:
+        For ``n=3`` and ``new_order = [2, 0, 1]`` (LSB first):
+          - New LSB (k=0) is original qubit 2,
+          - New middle bit (k=1) is original qubit 0,
+          - New MSB (k=2) is original qubit 1.
+        If original state has bits ``(b2 b1 b0)``, the new index corresponds to bits ``(b1 b0 b2)``
+        in MSB→LSB order.
     """
-    if len(new_order) != n or set(new_order) != set(range(n)):
+    # Validate
+    if not isinstance(n, int) or n < 0:
+        raise QiskitError("`n` must be a non‑negative integer.")
+    if len(new_order) != n:
+        raise QiskitError(f"`new_order` must have length n={n}.")
+    if set(new_order) != set(range(n)):
         raise QiskitError("`new_order` must be a permutation of range(n).")
+
     dim = 2**n
-    indices = np.arange(dim, dtype=np.int64)
-    bits = (indices[:, None] >> np.arange(n, dtype=np.int64)) & 1
-    reordered_bits = bits[:, new_order]
+    indices = np.arange(dim, dtype=np.int64)  # original indices i
+
+    # Extract original bits b_q (q=0 is LSB) for each index.
+    bits = (indices[:, None] >> np.arange(n, dtype=np.int64)) & 1  # shape (dim, n)
+
+    # Reorder bits so that new bit‑position k gets original bit from new_order[k].
+    reordered_bits = bits[:, new_order]  # shape (dim, n)
+
+    # Convert reordered bits to new indices i'
     new_indices = np.sum(reordered_bits << np.arange(n, dtype=np.int64), axis=1)
+
+    # Build permutation matrix with columns permuted by new_indices
     return np.eye(dim, dtype=bool)[:, new_indices]
 
 

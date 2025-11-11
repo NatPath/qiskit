@@ -9,33 +9,29 @@
 # Any modifications or derivative works of this code must retain this
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
+
 """Robust tests for tensor_product_decomposition.
+
 Covers:
-- All bipartitions for n up to MAX_N (both search orders).
-- All set partitions for n <= FULL_SET_PARTITIONS_UP_TO (both search orders).
-- Sampled set partitions for FULL_SET_PARTITIONS_UP_TO < n <= MAX_N (small_to_big).
+- All bipartitions for n up to MAX_N (both search modes).
+- All set partitions for n <= FULL_SET_PARTITIONS_UP_TO (both search modes).
+- Sampled set partitions for FULL_SET_PARTITIONS_UP_TO < n <= MAX_N.
+- Random Haar operators in best_only mode.
 """
+
 import itertools
 import unittest
 
 from ddt import ddt, data
 import numpy as np
 
-from qiskit import QuantumCircuit
-from qiskit.quantum_info import random_unitary, Operator
-
 from qiskit.quantum_info import random_unitary
 from qiskit.quantum_info.operators.tensor_product_decomposition import (
     tensor_product_decomposition,
-    circuit_from_tensor_product,
 )
-from qiskit.quantum_info.operators.operator_schmidt_decomposition import (
-    _permutation_matrix_from_qubit_order,
-)
-from qiskit.quantum_info.operators.predicates import ATOL_DEFAULT, RTOL_DEFAULT
 
 # =============================================================================
-# ------------------------------ CONFIG KNOBS ---------------------------------
+# ----------------------------- CONFIG KNOBS ----------------------------------
 # =============================================================================
 # Change MAX_N here; the rest adapts automatically.
 # Don't set too high (>10) as tests will take a lot of time.
@@ -53,13 +49,18 @@ SAMPLED_SET_PARTITIONS_PER_N = {
     10: 10,
 }
 
-# Search orders
+# Seeds/budgets
+BIPARTITION_SEEDS_PER_N = 2  # seeds per bipartition (product-building variety)
+BEST_ONLY_RANDOM_SEEDS_PER_N = 1  # random Haar operators per n for best_only sanity
+
 SEARCH_MODES = ("small_to_big", "big_to_small")
 
 
 # =============================================================================
 # -------------------------------- HELPERS ------------------------------------
 # =============================================================================
+
+
 def kron_msb_to_lsb(*factors: np.ndarray) -> np.ndarray:
     """Kronecker in MSB->LSB order (left arg acts on MSB)."""
     out = factors[0]
@@ -84,16 +85,30 @@ def canonicalize_blocks(blocks):
     return tuple(sorted((tuple(sorted(b)) for b in blocks), key=lambda t: (len(t), t)))
 
 
+def _perm_matrix_from_qubit_order(new_order, n_qubits):
+    """Boolean permutation matrix P for little-endian qubits: U_new = P U_old P^T."""
+    if len(new_order) != n_qubits or set(new_order) != set(range(n_qubits)):
+        raise ValueError("new_order must be a permutation of range(n)")
+    dim = 2**n_qubits
+    indices = np.arange(dim, dtype=np.int64)
+    bits = (indices[:, None] >> np.arange(n_qubits, dtype=np.int64)) & 1
+    reordered_bits = bits[:, new_order]
+    new_indices = np.sum(reordered_bits << np.arange(n_qubits, dtype=np.int64), axis=1)
+    return np.eye(dim, dtype=bool)[:, new_indices]
+
+
 def build_product_from_blocks(n_qubits, blocks, seeds):
     """Build exact product U for `blocks` (LSB->MSB) in the original little-endian order."""
     assert len(seeds) == len(blocks)
     mats = [random_unitary(2 ** len(blk), seed=sd).data for blk, sd in zip(blocks, seeds)]
+
     # Build MSB->LSB Kronecker so that block 0 truly lands on LSB after permutation.
     u_perm = mats[-1]  # start from MSB block
     for mat in reversed(mats[:-1]):  # fold down to LSB
         u_perm = np.kron(u_perm, mat)
+
     new_order = tuple(q for blk in blocks for q in blk)  # LSB block first
-    perm_matrix = _permutation_matrix_from_qubit_order(new_order, n_qubits)
+    perm_matrix = _perm_matrix_from_qubit_order(new_order, n_qubits)
     return perm_matrix.T @ u_perm @ perm_matrix
 
 
@@ -106,11 +121,13 @@ def enumerate_set_partitions(n_qubits):
             sorted_blocks = tuple(sorted(sorted_blocks, key=lambda t: (min(t), len(t), t)))
             yield sorted_blocks
             return
+
         # place idx into existing blocks
         for blk in acc_blocks:
             blk.append(idx)
             yield from _backtrack(idx + 1, acc_blocks)
             blk.pop()
+
         # start a new block with idx
         acc_blocks.append([idx])
         yield from _backtrack(idx + 1, acc_blocks)
@@ -157,45 +174,29 @@ def sample_set_partitions(n_qubits, count, rng):
 
 
 # =============================================================================
-# --------------------------- ASSERTION HELPERS --------------------------------
-# =============================================================================
-def _assert_diagnostics_consistent(testcase, res, u_op):
-    """Common assertions for residual/relative_residual/is_exact consistency."""
-    testcase.assertGreaterEqual(res.residual, 0.0)
-    testcase.assertGreaterEqual(res.relative_residual, 0.0)
-    denom = float(np.linalg.norm(u_op, ord="fro"))
-    # relative_residual ≈ residual / ||U||_F  (handle zero-norm edge case)
-    if denom == 0.0:
-        testcase.assertAlmostEqual(res.relative_residual, 0.0, places=12)
-    else:
-        testcase.assertAlmostEqual(res.relative_residual, res.residual / denom, places=12)
-    # is_exact matches tolerance predicate
-    atol = float(ATOL_DEFAULT)
-    rtol = float(RTOL_DEFAULT)
-    testcase.assertEqual(res.is_exact, bool(res.residual <= atol + rtol * denom))
-
-
-# =============================================================================
 # -------------------------------- TEST SUITES --------------------------------
 # =============================================================================
+
+
 @ddt
 class TestTPDAllBipartitionsExact(unittest.TestCase):
-    """Exhaustive bipartition tests for n in [2..MAX_N] in both search orders."""
+    """Exhaustive bipartition tests for n in [2..MAX_N] in both search modes."""
 
     @data(*range(2, MAX_N + 1))
-    def test_all_bipartitions_exact_both_orders(self, n_qubits):
+    def test_all_bipartitions_exact_both_modes(self, n_qubits):
         """All S|Sc for this n: exactness, canonical blocks, permutation, reconstruction."""
         for k_size in range(1, n_qubits // 2 + 1):
             for subset_s in itertools.combinations(range(n_qubits), k_size):
                 subset_sc = tuple(q for q in range(n_qubits) if q not in subset_s)
                 # LSB->MSB blocks = (subset_s, subset_sc) for deterministic product-building
                 blocks = (tuple(sorted(subset_s)), tuple(sorted(subset_sc)))
-                for seed_offset in range(2):  # modest variety
+                for seed_offset in range(BIPARTITION_SEEDS_PER_N):
                     seeds = tuple(1000 + seed_offset * 10 + i for i, _ in enumerate(blocks))
                     u_op = build_product_from_blocks(n_qubits, blocks, seeds)
                     for search in SEARCH_MODES:
                         res = tensor_product_decomposition(
                             u_op,
+                            mode="exact_only",
                             search=search,
                             return_operator=True,
                         )
@@ -226,8 +227,6 @@ class TestTPDAllBipartitionsExact(unittest.TestCase):
                                 atol=1e-12,
                             )
                             np.testing.assert_allclose(res.reconstruction, u_op, atol=1e-12)
-                            # Diagnostics
-                            _assert_diagnostics_consistent(self, res, u_op)
 
 
 @ddt
@@ -235,14 +234,16 @@ class TestTPDAllAndSampledSetPartitions(unittest.TestCase):
     """All set partitions for small n; sampled partitions for larger n (up to MAX_N)."""
 
     @data(*range(2, FULL_SET_PARTITIONS_UP_TO + 1))
-    def test_all_set_partitions_exact_both_orders(self, n_qubits):
-        """Exactness & equality to expected blocks for every set partition (both orders)."""
+    def test_all_set_partitions_exact_both_modes(self, n_qubits):
+        """Exactness & equality to expected blocks for every set partition (both modes)."""
         seed_base = 3000 + n_qubits * 100
         for idx, blocks in enumerate(enumerate_set_partitions(n_qubits)):
             seeds = tuple(seed_base + idx * 10 + i for i, _ in enumerate(blocks))
             u_op = build_product_from_blocks(n_qubits, blocks, seeds)
             for search in SEARCH_MODES:
-                res = tensor_product_decomposition(u_op, search=search, return_operator=True)
+                res = tensor_product_decomposition(
+                    u_op, mode="exact_only", search=search, return_operator=True
+                )
                 with self.subTest(n=n_qubits, idx=idx, search=search):
                     self.assertTrue(res.is_exact)
                     self.assertEqual(
@@ -251,8 +252,6 @@ class TestTPDAllAndSampledSetPartitions(unittest.TestCase):
                     )
                     self.assertTrue(blocks_cover_and_disjoint(res.blocks, n_qubits))
                     np.testing.assert_allclose(res.reconstruction, u_op, atol=1e-12)
-                    # Diagnostics
-                    _assert_diagnostics_consistent(self, res, u_op)
 
     @data(*range(FULL_SET_PARTITIONS_UP_TO + 1, MAX_N + 1))
     def test_sampled_set_partitions_exact_small_to_big(self, n_qubits):
@@ -266,7 +265,9 @@ class TestTPDAllAndSampledSetPartitions(unittest.TestCase):
         for idx, blocks in enumerate(parts):
             seeds = tuple(5000 + n_qubits * 100 + idx * 10 + i for i, _ in enumerate(blocks))
             u_op = build_product_from_blocks(n_qubits, blocks, seeds)
-            res = tensor_product_decomposition(u_op, search="small_to_big", return_operator=True)
+            res = tensor_product_decomposition(
+                u_op, mode="exact_only", search="small_to_big", return_operator=True
+            )
             with self.subTest(n=n_qubits, idx=idx):
                 self.assertTrue(res.is_exact)
                 self.assertEqual(
@@ -275,44 +276,52 @@ class TestTPDAllAndSampledSetPartitions(unittest.TestCase):
                 )
                 self.assertTrue(blocks_cover_and_disjoint(res.blocks, n_qubits))
                 np.testing.assert_allclose(res.reconstruction, u_op, atol=1e-12)
-                # Diagnostics
-                _assert_diagnostics_consistent(self, res, u_op)
+
+    @data(*range(FULL_SET_PARTITIONS_UP_TO + 1, MAX_N + 1))
+    def test_big_to_small_matches_small_on_sampled_partitions(self, n_qubits):
+        """For sampled partitions, small_to_big and big_to_small must agree on blocks."""
+        # Compare both modes on a small random subset (at most 15 partitions)
+        samples = min(15, SAMPLED_SET_PARTITIONS_PER_N.get(n_qubits, 0))
+        if samples <= 0:
+            self.skipTest(f"No samples configured for n={n_qubits}")
+        rng = np.random.default_rng(4500 + n_qubits)
+        parts = sample_set_partitions(n_qubits, samples, rng)
+        for idx, blocks in enumerate(parts):
+            seeds = tuple(6000 + n_qubits * 100 + idx * 10 + i for i, _ in enumerate(blocks))
+            u_op = build_product_from_blocks(n_qubits, blocks, seeds)
+            res_small = tensor_product_decomposition(u_op, mode="exact_only", search="small_to_big")
+            res_big = tensor_product_decomposition(u_op, mode="exact_only", search="big_to_small")
+            with self.subTest(n=n_qubits, idx=idx):
+                self.assertTrue(res_small.is_exact and res_big.is_exact)
+                self.assertEqual(
+                    canonicalize_blocks(res_small.blocks),
+                    canonicalize_blocks(blocks),
+                )
+                self.assertEqual(
+                    canonicalize_blocks(res_big.blocks),
+                    canonicalize_blocks(blocks),
+                )
 
 
-class TestTensorProductCircuit(unittest.TestCase):
-    def test_parallel_blocks_exact(self):
-        """If U is an exact tensor product across blocks, the circuit should match U exactly."""
-        n = 5
-        blocks = ((0, 2), (4,), (1, 3))
-        seeds = (10, 11, 12)
-        u = build_product_from_blocks(n, blocks, seeds)
+@ddt
+class TestTPDRandomBestOnlyUpToMaxN(unittest.TestCase):
+    """Random Haar unitary sanity for best_only: two blocks and inexact."""
 
-        pack = circuit_from_tensor_product(u, search="small_to_big")
-        qc = pack.circuit
-        self.assertTrue(pack.had_partitions)
-
-        # Compare circuit matrix directly
-        u_circ = Operator(qc).data
-        np.testing.assert_allclose(u_circ, u, atol=1e-12)
-
-        # Check decomposition metadata
-        decomp = pack.decomposition
-        self.assertTrue(decomp.is_exact)
-        canon = lambda blks: tuple(
-            sorted((tuple(sorted(b)) for b in blks), key=lambda t: (len(t), t))
-        )
-        self.assertEqual(canon(decomp.blocks), canon(blocks))
-
-    def test_no_partition_returns_single_gate_and_flag(self):
-        """For a generic random U, expect a single block and had_partitions=False."""
-        n = 3
-        u = random_unitary(2**n, seed=999).data
-        pack = circuit_from_tensor_product(u, search="small_to_big")
-        self.assertFalse(pack.had_partitions)
-
-        u_circ = Operator(pack.circuit).data
-        np.testing.assert_allclose(u_circ, u, atol=1e-12)
-        self.assertTrue(pack.decomposition.is_exact)
+    @data(*range(2, MAX_N + 1))
+    def test_random_best_only_two_block(self, n_qubits):
+        """Random U: best_only must return exactly 2 blocks and report inexactness."""
+        dim = 2**n_qubits
+        for seed_idx in range(BEST_ONLY_RANDOM_SEEDS_PER_N):
+            seed = 7000 + n_qubits * 10 + seed_idx
+            u_op = random_unitary(dim, seed=seed).data
+            # One mode here for time; both modes are exercised elsewhere.
+            res = tensor_product_decomposition(u_op, mode="best_only", search="small_to_big")
+            with self.subTest(n=n_qubits, seed=seed):
+                self.assertFalse(res.is_exact)
+                self.assertEqual(len(res.blocks), 2)
+                self.assertTrue(blocks_cover_and_disjoint(res.blocks, n_qubits))
+                # Unitaries after polar projection can be up to 2.0 away in relative Frobenius.
+                self.assertTrue(0.0 < res.relative_residual <= 2.0)
 
 
 if __name__ == "__main__":
